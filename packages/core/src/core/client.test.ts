@@ -341,13 +341,60 @@ describe('Gemini Client (client.ts)', () => {
   });
 
   describe('setHistory', () => {
-    it('should update telemetry token count when history is set', () => {
+    it('should update telemetry token count and clear currentSequenceModel when history is set', () => {
+      client['currentSequenceModel'] = 'gemini-3-flash-preview';
       const history: Content[] = [
         { role: 'user', parts: [{ text: 'some message' }] },
       ];
       client.setHistory(history);
 
       expect(uiTelemetryService.setLastPromptTokenCount).toHaveBeenCalled();
+      expect(client.getCurrentSequenceModel()).toBeNull();
+    });
+  });
+
+  describe('discardTrailingUnansweredToolCallTurn', () => {
+    it('should return false without throwing when the chat is not initialized', () => {
+      const uninitializedClient = new GeminiClient(
+        mockConfig as unknown as AgentLoopContext,
+      );
+
+      expect(uninitializedClient.isInitialized()).toBe(false);
+      expect(() =>
+        uninitializedClient.discardTrailingUnansweredToolCallTurn(),
+      ).not.toThrow();
+      expect(uninitializedClient.discardTrailingUnansweredToolCallTurn()).toBe(
+        false,
+      );
+    });
+
+    it('should delegate to the chat and update telemetry when a turn is removed', () => {
+      const mockChat = {
+        discardTrailingUnansweredToolCallTurn: vi.fn().mockReturnValue(true),
+        getLastPromptTokenCount: vi.fn().mockReturnValue(0),
+        setTools: vi.fn(),
+      } as unknown as GeminiChat;
+      client['chat'] = mockChat;
+      vi.mocked(uiTelemetryService.setLastPromptTokenCount).mockClear();
+
+      expect(client.discardTrailingUnansweredToolCallTurn()).toBe(true);
+      expect(
+        mockChat.discardTrailingUnansweredToolCallTurn,
+      ).toHaveBeenCalledTimes(1);
+      expect(uiTelemetryService.setLastPromptTokenCount).toHaveBeenCalled();
+    });
+
+    it('should not update telemetry when no turn is removed', () => {
+      const mockChat = {
+        discardTrailingUnansweredToolCallTurn: vi.fn().mockReturnValue(false),
+        getLastPromptTokenCount: vi.fn().mockReturnValue(0),
+        setTools: vi.fn(),
+      } as unknown as GeminiChat;
+      client['chat'] = mockChat;
+      vi.mocked(uiTelemetryService.setLastPromptTokenCount).mockClear();
+
+      expect(client.discardTrailingUnansweredToolCallTurn()).toBe(false);
+      expect(uiTelemetryService.setLastPromptTokenCount).not.toHaveBeenCalled();
     });
   });
 
@@ -814,9 +861,10 @@ describe('Gemini Client (client.ts)', () => {
       );
     });
 
-    it('yields UserCancelled when processTurn throws AbortError', async () => {
+    it('yields UserCancelled and clears sequence/turn state when processTurn throws AbortError', async () => {
       const abortError = new Error('Aborted');
       abortError.name = 'AbortError';
+      client['currentSequenceModel'] = 'gemini-3-flash-preview';
       vi.spyOn(client['loopDetector'], 'turnStarted').mockRejectedValueOnce(
         abortError,
       );
@@ -824,11 +872,13 @@ describe('Gemini Client (client.ts)', () => {
       const stream = client.sendMessageStream(
         [{ text: 'Hi' }],
         new AbortController().signal,
-        'prompt-id-abort-error',
+        'test-session-id',
       );
       const events = await fromAsync(stream);
 
       expect(events).toEqual([{ type: GeminiEventType.UserCancelled }]);
+      expect(client.getCurrentSequenceModel()).toBeNull();
+      expect(mockConfig.resetTurn).toHaveBeenCalledTimes(2);
     });
 
     it.each([

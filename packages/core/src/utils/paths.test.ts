@@ -21,15 +21,23 @@ import {
   toPathKey,
   isTrustedSystemPath,
   resolveDefensiveToolPath,
+  hasBlockedPathSegment,
   stripExtendedLengthPrefix,
 } from './paths.js';
 
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof fs>();
-  return {
+  const mockRealpath = (p: string) => p;
+  const mockedFs = {
     ...(actual as object),
-    realpathSync: (p: string) => p,
+    realpathSync: mockRealpath,
   };
+  Object.defineProperty(mockRealpath, 'native', {
+    value: (p: string) => mockedFs.realpathSync(p),
+    writable: true,
+    configurable: true,
+  });
+  return mockedFs;
 });
 
 const mockPlatform = (platform: string) => {
@@ -605,6 +613,41 @@ describe('resolveToRealPath', () => {
       /Infinite recursion detected/,
     );
   });
+
+  describe('on Windows realpathSync.native prefixes', () => {
+    beforeEach(() => {
+      mockPlatform('win32');
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it('should strip long path prefix \\\\?\\', () => {
+      vi.spyOn(fs.realpathSync, 'native').mockReturnValueOnce(
+        '\\\\?\\C:\\foo\\bar',
+      );
+      expect(resolveToRealPath('C:\\foo\\bar')).toBe('C:\\foo\\bar');
+    });
+
+    it('should strip UNC long path prefix \\\\?\\UNC\\ and keep UNC slash structure', () => {
+      vi.spyOn(fs.realpathSync, 'native').mockReturnValueOnce(
+        '\\\\?\\UNC\\server\\share\\foo',
+      );
+      expect(resolveToRealPath('\\\\server\\share\\foo')).toBe(
+        '\\\\server\\share\\foo',
+      );
+    });
+
+    it('should strip lowercase UNC long path prefix \\\\?\\unc\\ case-insensitively', () => {
+      vi.spyOn(fs.realpathSync, 'native').mockReturnValueOnce(
+        '\\\\?\\unc\\server\\share\\foo',
+      );
+      expect(resolveToRealPath('\\\\server\\share\\foo')).toBe(
+        '\\\\server\\share\\foo',
+      );
+    });
+  });
 });
 
 describe('stripExtendedLengthPrefix', () => {
@@ -897,6 +940,76 @@ describe('normalizePath', () => {
       expect(isTrustedSystemPath('/Library/rg')).toBe(false);
     });
 
+    it('should allow trusted paths on Android (Termux)', () => {
+      mockPlatform('android');
+      vi.stubEnv('PREFIX', '/data/data/com.termux/files/usr');
+
+      expect(
+        isTrustedSystemPath('/data/data/com.termux/files/usr/bin/rg'),
+      ).toBe(true);
+      expect(isTrustedSystemPath('/system/bin/rg')).toBe(true);
+      expect(isTrustedSystemPath('/system/xbin/rg')).toBe(true);
+
+      // Custom PREFIX (e.g. multi-user / work profile)
+      vi.stubEnv('PREFIX', '/data/user/10/com.termux/files/usr');
+      expect(
+        isTrustedSystemPath('/data/user/10/com.termux/files/usr/bin/rg'),
+      ).toBe(true);
+
+      // Untrusted paths on Android
+      expect(isTrustedSystemPath('/sdcard/Download/rg')).toBe(false);
+      expect(isTrustedSystemPath('/data/local/tmp/rg')).toBe(false);
+      expect(
+        isTrustedSystemPath('/data/data/com.termux/files/home/bin/rg'),
+      ).toBe(false);
+    });
+
+    it('should allow default Termux paths on Android when PREFIX is not set', () => {
+      mockPlatform('android');
+      vi.stubEnv('PREFIX', '');
+
+      expect(
+        isTrustedSystemPath('/data/data/com.termux/files/usr/bin/rg'),
+      ).toBe(true);
+    });
+
+    it('should ignore untrusted or malicious PREFIX values on Android', () => {
+      mockPlatform('android');
+
+      // Relative path / traversal attempt
+      vi.stubEnv('PREFIX', '../../tmp');
+      expect(isTrustedSystemPath('/tmp/bin/rg')).toBe(false);
+      expect(isTrustedSystemPath('../../tmp/bin/rg')).toBe(false);
+
+      // Path traversal attempt via absolute path
+      vi.stubEnv('PREFIX', '/data/data/com.termux/../../tmp');
+      expect(isTrustedSystemPath('/tmp/bin/rg')).toBe(false);
+
+      // User-writable or arbitrary directory
+      vi.stubEnv('PREFIX', '/sdcard/Download');
+      expect(isTrustedSystemPath('/sdcard/Download/bin/rg')).toBe(false);
+
+      vi.stubEnv('PREFIX', '/tmp');
+      expect(isTrustedSystemPath('/tmp/bin/rg')).toBe(false);
+
+      // Malicious package name prefixing com.termux
+      vi.stubEnv('PREFIX', '/data/data/com.termux.malicious/files/usr');
+      expect(
+        isTrustedSystemPath('/data/data/com.termux.malicious/files/usr/bin/rg'),
+      ).toBe(false);
+
+      // Termux path outside /files/usr (e.g. home directory)
+      vi.stubEnv('PREFIX', '/data/data/com.termux/files/home');
+      expect(
+        isTrustedSystemPath('/data/data/com.termux/files/home/bin/rg'),
+      ).toBe(false);
+
+      // Falls back to safe default
+      expect(
+        isTrustedSystemPath('/data/data/com.termux/files/usr/bin/rg'),
+      ).toBe(true);
+    });
+
     it('should allow 1P internal hermetic execution paths', () => {
       mockPlatform('linux');
 
@@ -956,6 +1069,45 @@ describe('normalizePath', () => {
       const filePathWithNull = '@/components/Button.tsx\0';
       const result = resolveDefensiveToolPath(filePathWithNull, targetDir);
       expect(result).toBe('components/Button.tsx');
+    });
+  });
+
+  describe('hasBlockedPathSegment', () => {
+    it('should identify standard blocked segments', () => {
+      expect(hasBlockedPathSegment('src/.git/config')).toBe(true);
+      expect(hasBlockedPathSegment('.env')).toBe(true);
+      expect(hasBlockedPathSegment('node_modules/lodash')).toBe(true);
+      expect(hasBlockedPathSegment('safe/path/here')).toBe(false);
+    });
+
+    it('should block .env variants while allowing safe templates', () => {
+      expect(hasBlockedPathSegment('.env.local')).toBe(true);
+      expect(hasBlockedPathSegment('.env.production')).toBe(true);
+      expect(hasBlockedPathSegment('config/.env.stage')).toBe(true);
+      expect(hasBlockedPathSegment('.env.development.local')).toBe(true);
+      expect(hasBlockedPathSegment('.env.example')).toBe(false);
+      expect(hasBlockedPathSegment('.env.sample')).toBe(false);
+      expect(hasBlockedPathSegment('.env.template')).toBe(false);
+      expect(hasBlockedPathSegment('.env.dist')).toBe(false);
+      expect(hasBlockedPathSegment('docs/.env.example')).toBe(false);
+    });
+
+    it('should identify NTFS 8.3 short name (SFN) blocked segments', () => {
+      expect(hasBlockedPathSegment('git~1/config')).toBe(true);
+      expect(hasBlockedPathSegment('gi1a2b~1/config')).toBe(true);
+      expect(hasBlockedPathSegment('env~1')).toBe(true);
+      expect(hasBlockedPathSegment('ENV~1.LOC')).toBe(true);
+      expect(hasBlockedPathSegment('env~1.loc')).toBe(true);
+      expect(hasBlockedPathSegment('en1a2b~1.pro')).toBe(true);
+      expect(hasBlockedPathSegment('node_m~1/lodash')).toBe(true);
+    });
+
+    it('should block standard and SFN patterns for gha-creds-*.json', () => {
+      expect(hasBlockedPathSegment('gha-creds-1234.json')).toBe(true);
+      expect(hasBlockedPathSegment('gha-cr~1.json')).toBe(true);
+      expect(hasBlockedPathSegment('gh1a2b~1.json')).toBe(true);
+      expect(hasBlockedPathSegment('gha-cr~1.jso')).toBe(true);
+      expect(hasBlockedPathSegment('gh1a2b~1.jso')).toBe(true);
     });
   });
 });

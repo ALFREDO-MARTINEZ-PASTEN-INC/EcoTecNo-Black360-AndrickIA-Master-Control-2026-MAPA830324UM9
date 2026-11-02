@@ -133,27 +133,30 @@ export function toPermissionOptions(
           });
         }
         break;
-      case 'mcp':
+      case 'mcp': {
+        const serverName = confirmation.serverName?.trim() || 'generic_server';
+        const toolName = confirmation.toolName?.trim() || 'generic_tool';
         options.push(
           {
             optionId: ToolConfirmationOutcome.ProceedAlwaysServer,
-            name: 'Allow all server tools for this session',
+            name: `Allow all "${serverName}" server tools for this session`,
             kind: 'allow_always',
           },
           {
             optionId: ToolConfirmationOutcome.ProceedAlwaysTool,
-            name: 'Allow tool for this session',
+            name: `Allow tool "${toolName}" for this session`,
             kind: 'allow_always',
           },
         );
         if (enablePermanentToolApproval) {
           options.push({
             optionId: ToolConfirmationOutcome.ProceedAlwaysAndSave,
-            name: 'Allow tool for all future sessions',
+            name: `Allow tool "${toolName}" for all future sessions`,
             kind: 'allow_always',
           });
         }
         break;
+      }
       case 'info':
         options.push({
           optionId: ToolConfirmationOutcome.ProceedAlways,
@@ -265,7 +268,8 @@ export function buildAvailableModels(
   const preferredModel = config.getModel() || GEMINI_MODEL_ALIAS_AUTO;
   const shouldShowPreviewModels = config.getHasAccessToPreviewModel();
   const useGemini31 = config.getGemini31LaunchedSync?.() ?? false;
-  const useGemini3_5Flash = config.hasGemini35FlashGAAccess?.() ?? false;
+  const useLatestFlash = config.hasLatestFlashGAAccess?.() ?? false;
+  const useLatestFlashLite = config.hasLatestFlashLiteGAAccess?.() ?? false;
   const selectedAuthType = settings.merged.security.auth.selectedType;
   const useCustomToolModel =
     useGemini31 && selectedAuthType === AuthType.USE_GEMINI;
@@ -277,7 +281,8 @@ export function buildAvailableModels(
   ) {
     const options = config.getModelConfigService().getAvailableModelOptions({
       useGemini3_1: useGemini31,
-      useGemini3_5Flash,
+      useLatestFlash,
+      useLatestFlashLite,
       useCustomTools: useCustomToolModel,
       hasAccessToPreview: shouldShowPreviewModels,
     });
@@ -296,7 +301,7 @@ export function buildAvailableModels(
       description: getAutoModelDescription(
         shouldShowPreviewModels,
         useGemini31,
-        useGemini3_5Flash,
+        useLatestFlash,
       ),
     },
   ];

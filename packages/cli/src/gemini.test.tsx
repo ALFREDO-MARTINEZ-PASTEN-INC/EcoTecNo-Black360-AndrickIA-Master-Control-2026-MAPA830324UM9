@@ -50,6 +50,7 @@ import {
   coreEvents,
   AuthType,
   ExitCodes,
+  disableLineWrapping,
 } from '@google/gemini-cli-core';
 import { act } from 'react';
 import { type InitializationResult } from './core/initializer.js';
@@ -194,6 +195,7 @@ vi.mock('./ui/utils/terminalCapabilityManager.js', () => ({
   terminalCapabilityManager: {
     detectCapabilities: vi.fn(),
     getTerminalBackgroundColor: vi.fn(),
+    areAmbiguousCharactersWide: vi.fn(() => false),
   },
 }));
 
@@ -1714,6 +1716,51 @@ describe('startInteractiveUI', () => {
     expect(reactElement).toBeDefined();
   });
 
+  it('should enable incrementalRendering when terminalBuffer is enabled and alternateBuffer is disabled', async () => {
+    const { render } = await import('ink');
+    const renderSpy = vi.mocked(render);
+    renderSpy.mockClear();
+
+    const terminalBufferConfig = createMockConfig({
+      getProjectRoot: () => '/root',
+      getScreenReader: () => false,
+      getDebugMode: () => false,
+      getUseAlternateBuffer: () => false,
+      getUseTerminalBuffer: () => true,
+    });
+    const terminalBufferSettings = {
+      merged: {
+        ui: {
+          hideWindowTitle: false,
+          useAlternateBuffer: false,
+          terminalBuffer: true,
+          incrementalRendering: true,
+        },
+        general: {
+          debugKeystrokeLogging: false,
+        },
+      },
+    } as LoadedSettings;
+
+    await startTestInteractiveUI(
+      terminalBufferConfig,
+      terminalBufferSettings,
+      mockStartupWarnings,
+      mockWorkspaceRoot,
+      undefined,
+      mockInitializationResult,
+    );
+
+    const [, options] = renderSpy.mock.calls[0];
+    expect(options).toEqual(
+      expect.objectContaining({
+        alternateBuffer: false,
+        terminalBuffer: true,
+        incrementalRendering: true,
+      }),
+    );
+  });
+
   it('should enable mouse events when alternate buffer is enabled', async () => {
     const { enableMouseEvents } = await import('@google/gemini-cli-core');
     await startTestInteractiveUI(
@@ -1839,5 +1886,96 @@ describe('startInteractiveUI', () => {
       expect(writeSpy).not.toHaveBeenCalledWith('\x1b[?7l');
     }
     writeSpy.mockRestore();
+  });
+
+  it.each([
+    {
+      ambiguousWide: true,
+      shouldDisable: true,
+      name: 'should disable line wrapping in inline mode when the terminal renders ambiguous-width characters as wide',
+    },
+    {
+      ambiguousWide: false,
+      shouldDisable: false,
+      name: 'should keep line wrapping in inline mode for a standard terminal',
+    },
+  ])('$name', async ({ ambiguousWide, shouldDisable }) => {
+    vi.mocked(disableLineWrapping).mockClear();
+    vi.mocked(
+      terminalCapabilityManager.areAmbiguousCharactersWide,
+    ).mockReturnValue(ambiguousWide);
+    const inlineModeConfig = createMockConfig({
+      getProjectRoot: () => '/root',
+      getScreenReader: () => false,
+      getDebugMode: () => false,
+      getUseAlternateBuffer: () => false,
+    });
+
+    await startTestInteractiveUI(
+      inlineModeConfig,
+      mockSettings,
+      mockStartupWarnings,
+      mockWorkspaceRoot,
+      undefined,
+      mockInitializationResult,
+    );
+
+    // In inline mode only the CLI itself can turn auto-wrap off (Ink does so
+    // on its own when it enters the alternate buffer).
+    if (shouldDisable) {
+      expect(disableLineWrapping).toHaveBeenCalledTimes(1);
+    } else {
+      expect(disableLineWrapping).not.toHaveBeenCalled();
+    }
+  });
+
+  it('should not delete session on exit when resumedSessionData is provided', async () => {
+    const mockDeleteIfNotResumable = vi.fn().mockResolvedValue(undefined);
+    const mockChatRecordingService = {
+      deleteCurrentSessionIfNotResumableAsync: mockDeleteIfNotResumable,
+    };
+    const mockGeminiClient = {
+      getChatRecordingService: vi
+        .fn()
+        .mockReturnValue(mockChatRecordingService),
+    };
+    const mockConfigWithClient = {
+      // eslint-disable-next-line @typescript-eslint/no-misused-spread
+      ...mockConfig,
+      getGeminiClient: vi.fn().mockReturnValue(mockGeminiClient),
+    } as unknown as Config;
+
+    const mockResumedData: ResumedSessionData = {
+      filePath: '/path/to/session.jsonl',
+      conversation: {
+        sessionId: 'resumed-session-id',
+        projectHash: 'hash',
+        startTime: new Date().toISOString(),
+        lastUpdated: new Date().toISOString(),
+        messages: [],
+      },
+    };
+
+    const { registerCleanup } = await import('./utils/cleanup.js');
+    const registerCleanupMock = vi.mocked(registerCleanup);
+    registerCleanupMock.mockClear();
+
+    await startTestInteractiveUI(
+      mockConfigWithClient,
+      mockSettings,
+      mockStartupWarnings,
+      mockWorkspaceRoot,
+      mockResumedData,
+      mockInitializationResult,
+    );
+
+    for (const call of registerCleanupMock.mock.calls) {
+      const fn = call[0];
+      if (typeof fn === 'function') {
+        await fn();
+      }
+    }
+
+    expect(mockDeleteIfNotResumable).not.toHaveBeenCalled();
   });
 });

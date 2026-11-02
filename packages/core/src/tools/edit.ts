@@ -34,7 +34,11 @@ import {
   resolveToRealPath,
 } from '../utils/paths.js';
 import { isNodeError } from '../utils/errors.js';
-import { correctPath } from '../utils/pathCorrector.js';
+import { withPathLock } from '../utils/pathMutex.js';
+import {
+  correctPath,
+  resolveActiveWorkspaceDir,
+} from '../utils/pathCorrector.js';
 import type { Config } from '../config/config.js';
 import { CoreToolCallStatus } from '../scheduler/types.js';
 
@@ -61,6 +65,8 @@ import { resolveToolDeclaration } from './definitions/resolver.js';
 import { detectOmissionPlaceholders } from './omissionPlaceholderDetector.js';
 import { discoverJitContext, appendJitContext } from './jit-context.js';
 import { resolveAndValidatePlanPath } from '../utils/planUtils.js';
+import { isBuildFile } from '../utils/buildFileUtils.js';
+import { recordModifiedBuildFile } from '../utils/untrustedContextTracker.js';
 
 const ENABLE_FUZZY_MATCH_RECOVERY = true;
 const FUZZY_MATCH_THRESHOLD = 0.1; // Allow up to 10% weighted difference
@@ -496,7 +502,14 @@ class EditToolInvocation
         this.resolvedPath = this.params.file_path.replace(/\0/g, '');
       }
     } else if (!path.isAbsolute(this.params.file_path)) {
-      const result = correctPath(this.params.file_path, this.config);
+      const targetDir = resolveActiveWorkspaceDir(
+        this.config,
+        this.params.file_path,
+      );
+      const result =
+        this.params.old_string === ''
+          ? ({ success: false, error: '' } as const)
+          : correctPath(this.params.file_path, this.config);
       if (result.success) {
         try {
           this.resolvedPath = resolveToRealPath(result.correctedPath);
@@ -506,17 +519,14 @@ class EditToolInvocation
       } else {
         const sanitizedPath = resolveDefensiveToolPath(
           this.params.file_path,
-          this.config.getTargetDir(),
+          targetDir,
         );
         try {
           this.resolvedPath = resolveToRealPath(
-            path.resolve(this.config.getTargetDir(), sanitizedPath),
+            path.resolve(targetDir, sanitizedPath),
           );
         } catch {
-          this.resolvedPath = path.resolve(
-            this.config.getTargetDir(),
-            sanitizedPath,
-          );
+          this.resolvedPath = path.resolve(targetDir, sanitizedPath);
         }
       }
     } else {
@@ -844,14 +854,19 @@ class EditToolInvocation
         ? ideClient.openDiff(this.resolvedPath, editData.newContent)
         : undefined;
 
+    const targetDir = resolveActiveWorkspaceDir(
+      this.config,
+      this.params.file_path,
+    );
     const confirmationDetails: ToolEditConfirmationDetails = {
       type: 'edit',
-      title: `Confirm Edit: ${shortenPath(makeRelative(this.resolvedPath, this.config.getTargetDir()))}`,
+      title: `Confirm Edit: ${shortenPath(makeRelative(this.resolvedPath, targetDir))}`,
       fileName,
       filePath: this.resolvedPath,
       fileDiff,
       originalContent: editData.currentContent,
       newContent: editData.newContent,
+      isBuildFile: isBuildFile(this.resolvedPath),
       onConfirm: async (_outcome: ToolConfirmationOutcome) => {
         // Mode transitions (e.g. AUTO_EDIT) and policy updates are now
         // handled centrally by the scheduler.
@@ -874,7 +889,7 @@ class EditToolInvocation
   getDescription(): string {
     const relativePath = makeRelative(
       this.resolvedPath,
-      this.config.getTargetDir(),
+      resolveActiveWorkspaceDir(this.config, this.params.file_path),
     );
     if (this.params.old_string === '') {
       return `Create ${shortenPath(relativePath)}`;
@@ -911,6 +926,43 @@ class EditToolInvocation
       };
     }
 
+    // Serialize the whole read-modify-write against other writers of this
+    // path. Two edits scheduled in parallel (common with sub-agents) would
+    // otherwise both read the original content, and whichever wrote second
+    // would silently discard the other's edit while still reporting success.
+    let lockKey = path.resolve(this.config.getTargetDir(), this.resolvedPath);
+    try {
+      lockKey = resolveToRealPath(lockKey);
+    } catch {
+      try {
+        const dir = path.dirname(lockKey);
+        const base = path.basename(lockKey);
+        lockKey = path.join(resolveToRealPath(dir), base);
+      } catch {
+        // Keep unresolved lockKey
+      }
+    }
+    try {
+      return await withPathLock(lockKey, () => this.applyEdit(signal), signal);
+    } catch (err) {
+      if (err instanceof Error && err.message === 'Aborted') {
+        throw new Error('Edit aborted');
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Computes and applies the edit.
+   *
+   * Must be called while holding the path lock for `this.resolvedPath`, so
+   * that the read in `calculateEdit` and the subsequent write cannot be
+   * interleaved with another writer of the same file.
+   */
+  private async applyEdit(signal: AbortSignal): Promise<ToolResult> {
+    if (signal.aborted) {
+      throw new Error('Edit aborted');
+    }
     let editData: CalculatedEdit;
     try {
       editData = await this.calculateEdit(this.params, signal);
@@ -956,9 +1008,17 @@ class EditToolInvocation
         .getFileSystemService()
         .writeTextFile(this.resolvedPath, finalContent);
 
+      if (isBuildFile(this.resolvedPath)) {
+        recordModifiedBuildFile(this.resolvedPath, this.config);
+      }
+
       let displayResult: ToolResultDisplay;
       if (editData.isNewFile) {
-        displayResult = `Created ${shortenPath(makeRelative(this.resolvedPath, this.config.getTargetDir()))}`;
+        const targetDir = resolveActiveWorkspaceDir(
+          this.config,
+          this.params.file_path,
+        );
+        displayResult = `Created ${shortenPath(makeRelative(this.resolvedPath, targetDir))}`;
       } else {
         // Generate diff for display, even though core logic doesn't technically need it
         // The CLI wrapper will use this part of the ToolResult
@@ -1011,6 +1071,7 @@ class EditToolInvocation
           newContent: editData.newContent,
           diffStat,
           isNewFile: editData.isNewFile,
+          isBuildFile: isBuildFile(this.resolvedPath),
         };
       }
 
@@ -1148,7 +1209,14 @@ export class EditTool
         return err instanceof Error ? err.message : String(err);
       }
     } else if (!path.isAbsolute(params.file_path)) {
-      const result = correctPath(params.file_path, this.config);
+      const targetDir = resolveActiveWorkspaceDir(
+        this.config,
+        params.file_path,
+      );
+      const result =
+        params.old_string === ''
+          ? ({ success: false, error: '' } as const)
+          : correctPath(params.file_path, this.config);
       if (result.success) {
         try {
           resolvedPath = resolveToRealPath(result.correctedPath);
@@ -1158,11 +1226,11 @@ export class EditTool
       } else {
         const sanitizedPath = resolveDefensiveToolPath(
           params.file_path,
-          this.config.getTargetDir(),
+          targetDir,
         );
         try {
           resolvedPath = resolveToRealPath(
-            path.resolve(this.config.getTargetDir(), sanitizedPath),
+            path.resolve(targetDir, sanitizedPath),
           );
         } catch (err) {
           return err instanceof Error ? err.message : String(err);
@@ -1222,18 +1290,22 @@ export class EditTool
             this.config.getProjectRoot(),
           );
         } else if (!path.isAbsolute(params.file_path)) {
-          const result = correctPath(params.file_path, this.config);
+          const targetDir = resolveActiveWorkspaceDir(
+            this.config,
+            params.file_path,
+          );
+          const result =
+            params.old_string === ''
+              ? ({ success: false, error: '' } as const)
+              : correctPath(params.file_path, this.config);
           if (result.success) {
             pathBeforeRealResolve = result.correctedPath;
           } else {
             const sanitizedPath = resolveDefensiveToolPath(
               params.file_path,
-              this.config.getTargetDir(),
+              targetDir,
             );
-            pathBeforeRealResolve = path.resolve(
-              this.config.getTargetDir(),
-              sanitizedPath,
-            );
+            pathBeforeRealResolve = path.resolve(targetDir, sanitizedPath);
           }
         } else {
           pathBeforeRealResolve = params.file_path.replace(/\0/g, '');
